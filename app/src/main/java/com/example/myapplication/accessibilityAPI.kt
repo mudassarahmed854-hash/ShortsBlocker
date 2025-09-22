@@ -4,8 +4,6 @@ import android.accessibilityservice.AccessibilityService
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -18,151 +16,170 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import java.util.LinkedList
-import java.util.Queue
 
 class MyAccessibilityService : AccessibilityService() {
 
-    // optional:  this is one way to add/remove packages and make changes on runtime
-//    override fun onServiceConnected() {
-//        val info: AccessibilityServiceInfo = AccessibilityServiceInfo()
-//        info.apply{
-//            eventTypes = AccessibilityEvent.TYPE_VIEW_CLICKED or AccessibilityEvent.TYPE_VIEW_FOCUSED
-//            packageNames = arrayOf("com.google.android.youtube")
-//            feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-//            notificationTimeout = 100
-//        }
-//        super.onServiceConnected()
-//        this.serviceInfo = info
-//    }
-
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var scannerJob: Job? = null
-    override fun onInterrupt() {
-        Log.d(TAG_MAIN, "Service interrupted.")
-    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        startForegroundServiceNotification()
+        startUniversalScanner() // Start a single, continuous scanner
+    }
 
+    private fun startForegroundServiceNotification() {
         val channelId = "shorts_blocker_service_channel"
         val channelName = "Shorts Blocker Service"
-        val notificationManager =
-            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        val channel =
-            NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_LOW)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channel = NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_LOW)
         notificationManager.createNotificationChannel(channel)
-
         val notification = NotificationCompat.Builder(this, channelId)
             .setContentTitle("Shorts Blocker is Active")
             .setContentText("Protecting your focus.")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
             .build()
-
-        // A unique integer ID for the notification
-        val NOTIFICATION_ID = 1
-        startForeground(NOTIFICATION_ID, notification)
+        startForeground(1, notification)
     }
 
-    // this is the main function called when "our" accessibility event is triggered
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event?.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-            val packageName = event.packageName?.toString()
-            Log.d(TAG_MAIN, "Window STATE changed")
-            handleAppChange(packageName)
-        }
-    }
+    // This is not needed in our new design
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
 
-    private fun handleAppChange(packageName: String?) {
-        // Stop any previously running scanner job to avoid multiple scanners.
+    override fun onInterrupt() {
+        Log.d(TAG_MAIN, "Service interrupted.")
         scannerJob?.cancel()
-
-        when (packageName) {
-            "com.google.android.youtube", "com.facebook.katana", "com.instagram.android" -> {
-                Log.d(TAG_MAIN, "Starting scanner")
-                startCoroutineScanner(packageName)
-            }
-
-            else -> {
-                Log.d(TAG_MAIN, "Non-target app detected. Scanner stopped.")
-                // Not a target app, do nothing. The job is already cancelled.
-            }
-        }
     }
 
-    private fun startCoroutineScanner(packageName: String) {
+    private fun startUniversalScanner() {
         scannerJob = serviceScope.launch {
-            while (isActive) { // This loop will automatically stop when the job is cancelled
+            while (isActive) {
                 val rootNode = rootInActiveWindow ?: run {
-                    Log.e(TAG_MAIN, "RootNode is null. Waiting and trying again.")
-                    delay(500) // If rootNode is null, wait and try again
+                    delay(500)
                     return@launch
                 }
 
-                val isShortsDetected = when (packageName) {
-                    "com.google.android.youtube" -> {
-                        isYouTubeShorts(rootNode)
+                // This safe-call ?.let prevents crashes if the package name is ever null
+                rootNode.packageName?.let { currentPackageName ->
+                    var isShortsDetected = false
+
+                    when (currentPackageName) {
+                        "com.google.android.youtube" -> {
+                            if (isYouTubeShorts(rootNode)) {
+                                Log.d(TAG_MAIN, "YouTube Shorts detected.")
+                                isShortsDetected = true
+                            }
+                        }
+                        "com.instagram.android" -> {
+                            if (isInstagramReels(rootNode)) {
+                                Log.d(TAG_MAIN, "Instagram Reels detected.")
+                                isShortsDetected = true
+                            }
+                        }
                     }
 
-                    "com.facebook.katana" -> {
-                        isFacebookReelsPlaying(rootNode)
+                    if (isShortsDetected) {
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        delay(1000)
                     }
-                    // Add case for "com.instagram.android" here
-                    "com.instagram.android" -> {
-                        isInstagramReelsPlaying(rootNode)
-                    }
-
-                    else -> false
                 }
 
-                if (isShortsDetected) {
-                    Log.d(
-                        TAG_MAIN,
-                        "Short-form video detected."
-                    )
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                }
                 delay(500)
             }
         }
     }
 
-    private fun isYouTubeShorts(node: AccessibilityNodeInfo): Boolean {
-        return findNodeByContentDescription(
-            node,
-            "See more videos using this sound"
-        ) || findNodeByContentDescription(node, "Video Progress")
+
+    // --- YOUTUBE DETECTION LOGIC ---
+    private fun isYouTubeShorts(rootNode: AccessibilityNodeInfo): Boolean {
+        if (isYouTubeShortsTabActive(rootNode)) return true
+        if (findNodeByResourceId(rootNode, "com.google.android.youtube:id/reel_watch_fragment_root")) return true
+        if (findNavigateUpButton(rootNode)) return true
+        return false
     }
 
-    private fun isFacebookReelsPlaying(node: AccessibilityNodeInfo?): Boolean {
-        return findNodeByContentDescription(node, "UP NEXT:") || findNodeByContentDescription(
-            node,
-            "Reel Found"
-        )
-    }
-
-    private fun isInstagramReelsPlaying(node: AccessibilityNodeInfo?): Boolean {
-        return findNodeByContentDescription(node, "Notes on Reels") || findNodeByContentDescription(
-            node,
-            "Double tap to play or pause."
-        )
-    }
-
-    private fun findNodeByContentDescription(node: AccessibilityNodeInfo?, text: String): Boolean {
-        if (node == null) {
-            Log.e(TAG_MAIN, "Node is null")
-            return false
+    private fun isYouTubeShortsTabActive(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        val isButton = "android.widget.Button" == node.className?.toString()
+        val isShortsDesc = "Shorts" == node.contentDescription?.toString()
+        val isSelected = node.isSelected
+        if (isButton && isShortsDesc && isSelected) return true
+        for (i in 0 until node.childCount) {
+            if (isYouTubeShortsTabActive(node.getChild(i))) return true
         }
-        node.contentDescription?.let { contentDesc ->
-            if (contentDesc.contains(text, ignoreCase = true)) {
-                Log.d(TAG_MAIN, "Found Shorts in Content Description")
+        return false
+    }
+
+    private fun findNavigateUpButton(node: AccessibilityNodeInfo?): Boolean {
+        if (node == null) return false
+        val isImageButton = "android.widget.ImageButton" == node.className?.toString()
+        val isNavigateUp = "Navigate up" == node.contentDescription?.toString()
+        if (isImageButton && isNavigateUp) return true
+        for (i in 0 until node.childCount) {
+            if (findNavigateUpButton(node.getChild(i))) return true
+        }
+        return false
+    }
+
+    // --- INSTAGRAM DETECTION LOGIC ---
+    private fun isInstagramReels(rootNode: AccessibilityNodeInfo): Boolean {
+        // Method 1: The most robust check. A Reels viewer is active AND the main feed is NOT.
+        // This correctly identifies the full-screen player while ignoring in-feed previews.
+        val isReelsViewerPresent = findNodeByResourceId(rootNode, "com.instagram.android:id/clips_viewer_view_pager")
+        val isMainFeedPresent = isMainFeedListPresent(rootNode)
+        if (isReelsViewerPresent && !isMainFeedPresent) {
+            Log.d(TAG_MAIN,"Instagram reel detected in clips viewer resource ID")
+            return true
+        }
+
+        // Method 2: The back button specific to some Reels UIs is present.
+        if (findNodeByResourceId(rootNode, "com.instagram.android:id/action_bar_button_back")) {
+            // We can make this safer too by checking that the main feed is absent.
+            if (!isMainFeedPresent) {
+                Log.d(TAG_MAIN,"Back button and not main feed. reel spotted.")
                 return true
             }
         }
+
+        // Method 3: The Reels tab on the bottom bar is selected. This implies the full-screen viewer.
+        if (isInstagramReelsTabActive(rootNode)) {
+            Log.d(TAG_MAIN,"Easiest one. instagram reels tab clicked.")
+            return true
+        }
+
+        return false
+    }
+
+    /**
+     * NEW: Helper function to check for the presence of the main feed's RecyclerView.
+     */
+    private fun isMainFeedListPresent(rootNode: AccessibilityNodeInfo?): Boolean {
+        // The main feed is contained in a RecyclerView with the resource ID "android:id/list".
+        return findNodeByResourceId(rootNode, "android:id/list")
+    }
+
+    private fun isInstagramReelsTabActive(rootNode: AccessibilityNodeInfo?): Boolean {
+        if (rootNode == null) return false
+        val reelTabs = rootNode.findAccessibilityNodeInfosByViewId("com.instagram.android:id/clips_tab")
+        for (node in reelTabs) {
+            if (node.isSelected) return true
+        }
+        return false
+    }
+
+    // --- GENERIC HELPER FUNCTIONS ---
+    private fun findNodeByResourceId(node: AccessibilityNodeInfo?, resourceId: String): Boolean {
+        if (node == null) return false
+        return node.findAccessibilityNodeInfosByViewId(resourceId).isNotEmpty()
+    }
+
+    private fun findNodeByPartialContentDescription(node: AccessibilityNodeInfo?, partialDesc: String): Boolean {
+        if (node == null) return false
+        if (node.contentDescription?.toString()?.contains(partialDesc, ignoreCase = true) == true) {
+            return true
+        }
         for (i in 0 until node.childCount) {
-            if (findNodeByContentDescription(node.getChild(i), text)) return true
+            if (findNodeByPartialContentDescription(node.getChild(i), partialDesc)) return true
         }
         return false
     }
